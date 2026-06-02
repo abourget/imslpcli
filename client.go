@@ -10,6 +10,12 @@ import (
 	"resty.dev/v3"
 )
 
+func init() {
+	// Load .env as early as possible so that os.Getenv calls anywhere (including
+	// in command handlers before NewClient is called) see the values.
+	_ = godotenv.Load()
+}
+
 // Client is the IMSLP API client (library).
 type Client struct {
 	*resty.Client

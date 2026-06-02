@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/joho/godotenv"
 	"github.com/spf13/cobra"
 )
 
@@ -19,6 +20,8 @@ var loginCmd = &cobra.Command{
 	Use:   "login",
 	Short: "Log in to IMSLP and obtain/save a login token",
 	RunE: func(cmd *cobra.Command, args []string) error {
+		_ = godotenv.Load() // ensure .env is loaded before we read IMSLP_* vars below
+
 		username, _ := cmd.Flags().GetString("username")
 		password, _ := cmd.Flags().GetString("password")
 
