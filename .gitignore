@@ -1,0 +1,6 @@
+.env
+.env.local
+dist/
+imslpcli
+*.exe
+*.har
