@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
+	"text/tabwriter"
 
 	"github.com/joho/godotenv"
 	"github.com/spf13/cobra"
@@ -151,6 +153,417 @@ var syncCmd = &cobra.Command{
 	},
 }
 
+// --- setlist subcommands (create / modify using the patterns from the HAR) ---
+
+var setlistCmd = &cobra.Command{
+	Use:   "setlist",
+	Short: "Manage setlists (playlists) - create, rename, clone, reorder, delete",
+}
+
+var setlistListCmd = &cobra.Command{
+	Use:   "list",
+	Short: "List current setlists (from a fresh full sync)",
+	RunE: func(cmd *cobra.Command, args []string) error {
+		client := NewClient()
+		if err := client.EnsureAuth(); err != nil {
+			return err
+		}
+		items, _, _, _, err := client.FetchCurrentState()
+		if err != nil {
+			return err
+		}
+		var lists []any
+		for _, it := range items {
+			if m, ok := it.(map[string]any); ok {
+				if t, _ := m["type"].(float64); int(t) == 1 {
+					lists = append(lists, it)
+				}
+			}
+		}
+		// write for convenience
+		b, _ := json.MarshalIndent(lists, "", "  ")
+		_ = os.WriteFile("setlists.json", b, 0644)
+		fmt.Printf("%d setlists:\n", len(lists))
+		w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(w, "ID\tNAME\tITEMS")
+		for _, l := range lists {
+			if m, ok := l.(map[string]any); ok {
+				data := getMap(m, "data")
+				id := getString(m, "itemId")
+				name := getString(data, "name")
+				n := len(getAnySlice(data, "items"))
+				fmt.Fprintf(w, "%s\t%s\t%d\n", id, name, n)
+			}
+		}
+		w.Flush()
+		return nil
+	},
+}
+
+var setlistCreateCmd = &cobra.Command{
+	Use:   "create <name> [scoreItemId1 scoreItemId2 ...]",
+	Short: "Create a brand new setlist (like the initial create in the HAR)",
+	Args:  cobra.MinimumNArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		client := NewClient()
+		if err := client.EnsureAuth(); err != nil {
+			return err
+		}
+		name := args[0]
+		ids := args[1:]
+		newID, err := client.CreateSetlist(name, ids)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("Created setlist %q -> itemId=%s\n", name, newID)
+		// refresh local files
+		return refreshSetlistsAndScores(client)
+	},
+}
+
+var setlistCloneCmd = &cobra.Command{
+	Use:   "clone <sourceItemIdOrName> <newName>",
+	Short: "Clone an existing setlist (the pattern used in the session)",
+	Args:  cobra.ExactArgs(2),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		client := NewClient()
+		if err := client.EnsureAuth(); err != nil {
+			return err
+		}
+		srcID := args[0]
+		newName := args[1]
+
+		current, err := findSetlist(client, srcID)
+		if err != nil {
+			return err
+		}
+		newID, err := client.CloneSetlist(current, newName)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("Cloned to new setlist %q -> itemId=%s\n", newName, newID)
+		return refreshSetlistsAndScores(client)
+	},
+}
+
+var setlistRenameCmd = &cobra.Command{
+	Use:   "rename <itemIdOrName> <newName>",
+	Short: "Rename a setlist (update data.name, with oldData)",
+	Args:  cobra.ExactArgs(2),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		client := NewClient()
+		if err := client.EnsureAuth(); err != nil {
+			return err
+		}
+		idOrName := args[0]
+		newName := args[1]
+
+		cur, err := findSetlist(client, idOrName)
+		if err != nil {
+			return err
+		}
+		data := getMap(cur, "data")
+		oldItems := getAnySlice(data, "items")
+		if err := client.UpdateSetlist(cur, newName, oldItems); err != nil {
+			return err
+		}
+		fmt.Printf("Renamed setlist to %q\n", newName)
+		return refreshSetlistsAndScores(client)
+	},
+}
+
+var setlistReorderCmd = &cobra.Command{
+	Use:   "reorder <itemIdOrName> <id1> <id2> ...",
+	Short: "Change the order (or membership) of a setlist (provides oldData)",
+	Args:  cobra.MinimumNArgs(2),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		client := NewClient()
+		if err := client.EnsureAuth(); err != nil {
+			return err
+		}
+		idOrName := args[0]
+		newOrder := args[1:]
+
+		cur, err := findSetlist(client, idOrName)
+		if err != nil {
+			return err
+		}
+		data := getMap(cur, "data")
+		oldName := getString(data, "name")
+		// convert []string from CLI args to []any
+		ids := make([]any, len(newOrder))
+		for i, s := range newOrder {
+			ids[i] = s
+		}
+		if err := client.UpdateSetlist(cur, oldName, ids); err != nil {
+			return err
+		}
+		fmt.Printf("Reordered setlist %q\n", oldName)
+		return refreshSetlistsAndScores(client)
+	},
+}
+
+var setlistDeleteCmd = &cobra.Command{
+	Use:   "delete <itemIdOrName>",
+	Short: "Delete a setlist (the isDeleted:1 + oldData pattern from the HAR)",
+	Args:  cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		client := NewClient()
+		if err := client.EnsureAuth(); err != nil {
+			return err
+		}
+		cur, err := findSetlist(client, args[0])
+		if err != nil {
+			return err
+		}
+		name := getString(getMap(cur, "data"), "name")
+		if err := client.DeleteSetlist(cur); err != nil {
+			return err
+		}
+		fmt.Printf("Deleted setlist %q\n", name)
+		return refreshSetlistsAndScores(client)
+	},
+}
+
+var setlistAppendCmd = &cobra.Command{
+	Use:   "append <setlist-id-or-name> <score-id>",
+	Short: "Append a score (by its ID) to the end of a setlist",
+	Args:  cobra.ExactArgs(2),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		client := NewClient()
+		if err := client.EnsureAuth(); err != nil {
+			return err
+		}
+		setlistRef, scoreID := args[0], args[1]
+		cur, err := findSetlist(client, setlistRef)
+		if err != nil {
+			return err
+		}
+		if err := client.AppendToSetlist(cur, scoreID); err != nil {
+			return err
+		}
+		fmt.Printf("Appended %s to setlist\n", scoreID)
+		return refreshSetlistsAndScores(client)
+	},
+}
+
+var setlistPrependCmd = &cobra.Command{
+	Use:   "prepend <setlist-id-or-name> <score-id>",
+	Short: "Prepend a score (by its ID) to the beginning of a setlist",
+	Args:  cobra.ExactArgs(2),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		client := NewClient()
+		if err := client.EnsureAuth(); err != nil {
+			return err
+		}
+		setlistRef, scoreID := args[0], args[1]
+		cur, err := findSetlist(client, setlistRef)
+		if err != nil {
+			return err
+		}
+		if err := client.PrependToSetlist(cur, scoreID); err != nil {
+			return err
+		}
+		fmt.Printf("Prepended %s to setlist\n", scoreID)
+		return refreshSetlistsAndScores(client)
+	},
+}
+
+var setlistInsertCmd = &cobra.Command{
+	Use:   "insert <setlist-id-or-name> <prev-score-id> <new-score-id>",
+	Short: "Insert new-score-id right after prev-score-id in the setlist",
+	Args:  cobra.ExactArgs(3),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		client := NewClient()
+		if err := client.EnsureAuth(); err != nil {
+			return err
+		}
+		setlistRef, prevID, newID := args[0], args[1], args[2]
+		cur, err := findSetlist(client, setlistRef)
+		if err != nil {
+			return err
+		}
+		if err := client.InsertAfterInSetlist(cur, prevID, newID); err != nil {
+			return err
+		}
+		fmt.Printf("Inserted %s after %s in setlist\n", newID, prevID)
+		return refreshSetlistsAndScores(client)
+	},
+}
+
+var setlistSearchCmd = &cobra.Command{
+	Use:   "search <query>",
+	Short: "Search setlists by name (case-insens), shows ID and Name (use ID to refer unambiguously)",
+	Args:  cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		client := NewClient()
+		if err := client.EnsureAuth(); err != nil {
+			return err
+		}
+		results, err := client.SearchSetlists(args[0])
+		if err != nil {
+			return err
+		}
+		for _, r := range results {
+			fmt.Printf("%s\t%s\n", r.ID, r.Name)
+		}
+		if len(results) == 0 {
+			fmt.Println("no matches")
+		}
+		return nil
+	},
+}
+
+var setlistShowCmd = &cobra.Command{
+	Use:   "show <setlist-id-or-name>",
+	Short: "Show all scores in a setlist (by ID or name), using Work Title from scores",
+	Args:  cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		client := NewClient()
+		if err := client.EnsureAuth(); err != nil {
+			return err
+		}
+		ref := args[0]
+		allItems, _, _, _, err := client.FetchCurrentState()
+		if err != nil {
+			return err
+		}
+		// find setlist (dupe of findSetlist logic to avoid extra fetch)
+		var setlist map[string]any
+		trimmed := strings.TrimSpace(ref)
+		for _, it := range allItems {
+			if m, ok := it.(map[string]any); ok {
+				if t, _ := m["type"].(float64); int(t) == 1 {
+					data := getMap(m, "data")
+					if getString(m, "itemId") == ref || strings.TrimSpace(getString(data, "name")) == trimmed {
+						setlist = m
+						break
+					}
+				}
+			}
+		}
+		if setlist == nil {
+			return fmt.Errorf("no setlist found with id or name %q (run `imslpcli setlist list`)", ref)
+		}
+		data := getMap(setlist, "data")
+		name := getString(data, "name")
+		id := getString(setlist, "itemId")
+		scoreIDs := getAnySlice(data, "items")
+		// build score id -> title map
+		scoreTitles := map[string]string{}
+		for _, it := range allItems {
+			if m, ok := it.(map[string]any); ok {
+				if t, _ := m["type"].(float64); int(t) == 0 {
+					sid := getString(m, "itemId")
+					sdata := getMap(m, "data")
+					title := ""
+					for _, infIface := range getAnySlice(sdata, "info") {
+						inf, ok := infIface.([]any)
+						if !ok || len(inf) < 2 {
+							continue
+						}
+						key := strings.ToLower(fmt.Sprintf("%v", inf[0]))
+						val := fmt.Sprintf("%v", inf[1])
+						if key == "work title" {
+							title = val
+							break
+						}
+					}
+					scoreTitles[sid] = title
+				}
+			}
+		}
+		fmt.Printf("Setlist %s (%s) has %d scores:\n", name, id, len(scoreIDs))
+		w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(w, "ID\tTITLE")
+		for _, sidIface := range scoreIDs {
+			sid := fmt.Sprintf("%v", sidIface)
+			title := scoreTitles[sid]
+			if title == "" {
+				title = "(not found / deleted?)"
+			}
+			fmt.Fprintf(w, "%s\t%s\n", sid, title)
+		}
+		w.Flush()
+		return nil
+	},
+}
+
+var scoresCmd = &cobra.Command{
+	Use:   "scores",
+	Short: "Commands for searching scores in your library",
+}
+
+var scoresSearchCmd = &cobra.Command{
+	Use:   "search <query>",
+	Short: "Search scores (by Work Title or other info), prints ID and Work Title",
+	Args:  cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		client := NewClient()
+		if err := client.EnsureAuth(); err != nil {
+			return err
+		}
+		results, err := client.SearchScores(args[0])
+		if err != nil {
+			return err
+		}
+		for _, r := range results {
+			fmt.Printf("%s\t%s\n", r.ID, r.Title)
+		}
+		if len(results) == 0 {
+			fmt.Println("no matches")
+		}
+		return nil
+	},
+}
+
+func findSetlist(client *Client, idOrName string) (map[string]any, error) {
+	items, _, _, _, err := client.FetchCurrentState()
+	if err != nil {
+		return nil, err
+	}
+	trimmed := strings.TrimSpace(idOrName)
+	for _, it := range items {
+		if m, ok := it.(map[string]any); ok {
+			if t, _ := m["type"].(float64); int(t) == 1 {
+				data := getMap(m, "data")
+				if getString(m, "itemId") == idOrName || strings.TrimSpace(getString(data, "name")) == trimmed {
+					return m, nil
+				}
+			}
+		}
+	}
+	return nil, fmt.Errorf("no setlist found with id or name %q (run `imslpcli setlist list`)", idOrName)
+}
+
+func refreshSetlistsAndScores(client *Client) error {
+	items, _, _, _, err := client.FetchCurrentState()
+	if err != nil {
+		return err
+	}
+	var scores, lists []any
+	for _, it := range items {
+		if m, ok := it.(map[string]any); ok {
+			if t, _ := m["type"].(float64); ok {
+				switch int(t) {
+				case 0:
+					scores = append(scores, it)
+				case 1:
+					lists = append(lists, it)
+				}
+			}
+		}
+	}
+	if b, _ := json.MarshalIndent(scores, "", "  "); len(b) > 2 {
+		_ = os.WriteFile("scores.json", b, 0644)
+	}
+	if b, _ := json.MarshalIndent(lists, "", "  "); len(b) > 2 {
+		_ = os.WriteFile("setlists.json", b, 0644)
+	}
+	fmt.Printf("Refreshed: %d scores, %d setlists\n", len(scores), len(lists))
+	return nil
+}
+
 func init() {
 	loginCmd.Flags().StringP("username", "u", "", "IMSLP username or email (falls back to IMSLP_USERNAME env)")
 	loginCmd.Flags().StringP("password", "p", "", "IMSLP password (falls back to IMSLP_PASSWORD env)")
@@ -158,6 +571,22 @@ func init() {
 	rootCmd.AddCommand(loginCmd)
 	rootCmd.AddCommand(whoamiCmd)
 	rootCmd.AddCommand(syncCmd)
+
+	setlistCmd.AddCommand(setlistListCmd)
+	setlistCmd.AddCommand(setlistCreateCmd)
+	setlistCmd.AddCommand(setlistCloneCmd)
+	setlistCmd.AddCommand(setlistRenameCmd)
+	setlistCmd.AddCommand(setlistReorderCmd)
+	setlistCmd.AddCommand(setlistDeleteCmd)
+	setlistCmd.AddCommand(setlistAppendCmd)
+	setlistCmd.AddCommand(setlistPrependCmd)
+	setlistCmd.AddCommand(setlistInsertCmd)
+	setlistCmd.AddCommand(setlistSearchCmd)
+	setlistCmd.AddCommand(setlistShowCmd)
+	rootCmd.AddCommand(setlistCmd)
+
+	scoresCmd.AddCommand(scoresSearchCmd)
+	rootCmd.AddCommand(scoresCmd)
 }
 
 func main() {

@@ -3,4 +3,5 @@
 dist/
 imslpcli
 *.exe
+backup/
 *.har

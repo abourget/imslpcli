@@ -1,10 +1,13 @@
 package main
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/joho/godotenv"
 	"resty.dev/v3"
@@ -181,9 +184,11 @@ func (c *Client) SyncPut(items []any) (map[string]any, error) {
 }
 
 // FetchCurrentState performs a full sync starting from revision 0, paging through
-// all history (following revision cursors until remaining==0), then returns only
-// the current (non-deleted) items. This gives the complete up-to-date library
-// instead of just one page of the change log.
+// all history by repeatedly calling sync.get and following the returned revision
+// cursors. It stops only when a response contains no items (len(items)==0).
+// This ensures it pulls the absolute latest changes (including live deltas pushed
+// by other clients/apps after previous syncs), not just up to the point where
+// "remaining" first hits 0.
 func (c *Client) FetchCurrentState() (currentItems []any, finalPos, finalMaj, finalReq int, err error) {
 	itemMap := map[string]map[string]any{}
 	pos, req, maj := 0, 0, 0
@@ -192,7 +197,9 @@ func (c *Client) FetchCurrentState() (currentItems []any, finalPos, finalMaj, fi
 		if err != nil {
 			return nil, 0, 0, 0, err
 		}
+		nitems := 0
 		if itemsIface, ok := data["items"].([]any); ok {
+			nitems = len(itemsIface)
 			for _, itIface := range itemsIface {
 				if it, ok := itIface.(map[string]any); ok {
 					if id, ok := it["itemId"].(string); ok && id != "" {
@@ -211,11 +218,7 @@ func (c *Client) FetchCurrentState() (currentItems []any, finalPos, finalMaj, fi
 		if v, ok := data["revisionRequested"].(float64); ok {
 			req = int(v)
 		}
-		rem := 0.0
-		if v, ok := data["remaining"].(float64); ok {
-			rem = v
-		}
-		if rem <= 0 {
+		if nitems == 0 {
 			break
 		}
 	}
@@ -278,4 +281,334 @@ func SaveTokenToEnv(token string) error {
 	}
 
 	return os.WriteFile(envPath, []byte(newContent), 0600)
+}
+
+// --- Setlist mutation helpers (reverse engineered from HAR session) ---
+
+// generateSetlistItemID produces itemIds in the exact format the app uses:
+// <unix_millis>-<16 uppercase hex chars>
+func generateSetlistItemID() string {
+	ts := time.Now().UnixMilli()
+	b := make([]byte, 8)
+	if _, err := rand.Read(b); err != nil {
+		// very unlikely; fallback to deterministic for the call
+		copy(b, []byte{0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef})
+	}
+	return fmt.Sprintf("%d-%s", ts, strings.ToUpper(hex.EncodeToString(b)))
+}
+
+func getMap(m map[string]any, key string) map[string]any {
+	if v, ok := m[key]; ok {
+		if mm, ok := v.(map[string]any); ok {
+			return mm
+		}
+	}
+	return map[string]any{}
+}
+
+func getString(m map[string]any, key string) string {
+	if v, ok := m[key]; ok {
+		if s, ok := v.(string); ok {
+			return s
+		}
+	}
+	return ""
+}
+
+func getAnySlice(m map[string]any, key string) []any {
+	if v, ok := m[key]; ok {
+		if s, ok := v.([]any); ok {
+			return s
+		}
+	}
+	return nil
+}
+
+// CreateSetlist creates a completely new setlist (corresponds to the initial
+// userId:false puts with no oldData in the HAR).
+// Returns the new itemId.
+func (c *Client) CreateSetlist(name string, scoreItemIDs []string) (string, error) {
+	itemID := generateSetlistItemID()
+	now := time.Now().UnixMilli()
+
+	item := map[string]any{
+		"itemId":     itemID,
+		"userId":     false,
+		"type":       1,
+		"fileItemId": nil,
+		"data": map[string]any{
+			"name":  name,
+			"items": scoreItemIDs,
+		},
+		"revision":  0, // the server accepts and will assign real rev on next sync
+		"createdAt": now,
+		"updatedAt": now,
+		"shareId":   0,
+		"isDeleted": false,
+	}
+	if _, err := c.SyncPut([]any{item}); err != nil {
+		return "", err
+	}
+	return itemID, nil
+}
+
+// CloneSetlist creates a new setlist by copying the members of an existing one
+// (this is what the session did for "clone"). It follows the HAR pattern of
+// supplying oldData even on the create put.
+func (c *Client) CloneSetlist(source map[string]any, newName string) (string, error) {
+	if source == nil {
+		return "", fmt.Errorf("source setlist item required")
+	}
+	srcData := getMap(source, "data")
+	itemID := generateSetlistItemID()
+	now := time.Now().UnixMilli()
+
+	data := map[string]any{
+		"name":  newName,
+		"items": getAnySlice(srcData, "items"),
+	}
+	oldData := map[string]any{
+		"name":  getString(srcData, "name"),
+		"items": getAnySlice(srcData, "items"),
+	}
+
+	item := map[string]any{
+		"itemId":     itemID,
+		"userId":     false,
+		"type":       1,
+		"fileItemId": nil,
+		"data":       data,
+		"revision":   source["revision"],
+		"createdAt":  now,
+		"updatedAt":  now,
+		"shareId":    0,
+		"oldData":    oldData,
+		"isDeleted":  false,
+	}
+	if _, err := c.SyncPut([]any{item}); err != nil {
+		return "", err
+	}
+	return itemID, nil
+}
+
+// UpdateSetlist performs a rename, reorder, add or remove on an existing setlist.
+// You must pass the *current* full item (as returned by FetchCurrentState or
+// loaded from your setlists.json) so we can build the correct oldData that the
+// backend expects for modifications.
+func (c *Client) UpdateSetlist(current map[string]any, newName string, newScoreItemIDs []any) error {
+	if current == nil {
+		return fmt.Errorf("current setlist item (from sync) is required")
+	}
+	itemID := getString(current, "itemId")
+	if itemID == "" {
+		return fmt.Errorf("current item has no itemId")
+	}
+
+	curData := getMap(current, "data")
+	oldData := map[string]any{
+		"name":  getString(curData, "name"),
+		"items": getAnySlice(curData, "items"),
+	}
+
+	now := time.Now().UnixMilli()
+	newData := map[string]any{
+		"name":  newName,
+		"items": newScoreItemIDs,
+	}
+
+	putItem := map[string]any{
+		"itemId":     itemID,
+		"userId":     current["userId"],
+		"type":       1,
+		"fileItemId": current["fileItemId"],
+		"data":       newData,
+		"revision":   current["revision"],
+		"createdAt":  current["createdAt"],
+		"updatedAt":  now,
+		"shareId":    current["shareId"],
+		"oldData":    oldData,
+		"isDeleted":  false,
+	}
+	_, err := c.SyncPut([]any{putItem})
+	return err
+}
+
+// DeleteSetlist marks a setlist as deleted (the isDeleted:1 + oldData pattern).
+func (c *Client) DeleteSetlist(current map[string]any) error {
+	if current == nil {
+		return fmt.Errorf("current setlist item required")
+	}
+	itemID := getString(current, "itemId")
+	curData := getMap(current, "data")
+	oldData := map[string]any{
+		"name":  getString(curData, "name"),
+		"items": getAnySlice(curData, "items"),
+	}
+
+	now := time.Now().UnixMilli()
+
+	putItem := map[string]any{
+		"itemId":     itemID,
+		"userId":     current["userId"],
+		"type":       1,
+		"fileItemId": current["fileItemId"],
+		"data":       curData, // keep current name/items in data
+		"revision":   current["revision"],
+		"createdAt":  current["createdAt"],
+		"updatedAt":  now,
+		"shareId":    current["shareId"],
+		"oldData":    oldData,
+		"isDeleted":  1, // important: 1 (number) as seen in HAR
+	}
+	_, err := c.SyncPut([]any{putItem})
+	return err
+}
+
+// AppendToSetlist appends scoreID to the end of the current setlist's items list
+// (does nothing if already present). Uses UpdateSetlist internally so oldData is provided.
+func (c *Client) AppendToSetlist(current map[string]any, scoreID string) error {
+	if current == nil {
+		return fmt.Errorf("current setlist item required")
+	}
+	data := getMap(current, "data")
+	items := getAnySlice(data, "items")
+	for _, id := range items {
+		if fmt.Sprintf("%v", id) == scoreID {
+			return nil
+		}
+	}
+	newItems := append(append([]any(nil), items...), scoreID)
+	name := getString(data, "name")
+	return c.UpdateSetlist(current, name, newItems)
+}
+
+// PrependToSetlist inserts scoreID at the beginning (if not already present).
+func (c *Client) PrependToSetlist(current map[string]any, scoreID string) error {
+	if current == nil {
+		return fmt.Errorf("current setlist item required")
+	}
+	data := getMap(current, "data")
+	items := getAnySlice(data, "items")
+	for _, id := range items {
+		if fmt.Sprintf("%v", id) == scoreID {
+			return nil
+		}
+	}
+	newItems := append([]any{scoreID}, items...)
+	name := getString(data, "name")
+	return c.UpdateSetlist(current, name, newItems)
+}
+
+// InsertAfterInSetlist inserts insertedID immediately after prevID.
+// If prevID is not found, appends at the end (unless inserted already present).
+func (c *Client) InsertAfterInSetlist(current map[string]any, prevID, insertedID string) error {
+	if current == nil {
+		return fmt.Errorf("current setlist item required")
+	}
+	data := getMap(current, "data")
+	items := getAnySlice(data, "items")
+
+	// dedup check
+	for _, id := range items {
+		if fmt.Sprintf("%v", id) == insertedID {
+			return nil
+		}
+	}
+
+	newItems := make([]any, 0, len(items)+1)
+	inserted := false
+	for _, id := range items {
+		newItems = append(newItems, id)
+		if fmt.Sprintf("%v", id) == prevID {
+			newItems = append(newItems, insertedID)
+			inserted = true
+		}
+	}
+	if !inserted {
+		newItems = append(newItems, insertedID)
+	}
+
+	name := getString(data, "name")
+	return c.UpdateSetlist(current, name, newItems)
+}
+
+// ScoreSearchResult for search.
+type ScoreSearchResult struct {
+	ID    string
+	Title string
+}
+
+// SearchScores does a full sync then returns scores whose info (esp. Work Title)
+// contains the query (case-insensitive). Returns ID (itemId) and Title.
+func (c *Client) SearchScores(query string) ([]ScoreSearchResult, error) {
+	items, _, _, _, err := c.FetchCurrentState()
+	if err != nil {
+		return nil, err
+	}
+	q := strings.ToLower(query)
+	var res []ScoreSearchResult
+	for _, itIface := range items {
+		it, ok := itIface.(map[string]any)
+		if !ok {
+			continue
+		}
+		if t, _ := it["type"].(float64); int(t) != 0 {
+			continue
+		}
+		data := getMap(it, "data")
+		title := ""
+		matches := false
+		for _, infIface := range getAnySlice(data, "info") {
+			inf, ok := infIface.([]any)
+			if !ok || len(inf) < 2 {
+				continue
+			}
+			key := strings.ToLower(fmt.Sprintf("%v", inf[0]))
+			val := fmt.Sprintf("%v", inf[1])
+			if key == "work title" {
+				title = val
+			}
+			if strings.Contains(strings.ToLower(val), q) || strings.Contains(key, q) {
+				matches = true
+			}
+		}
+		if matches {
+			id := getString(it, "itemId")
+			res = append(res, ScoreSearchResult{ID: id, Title: title})
+		}
+	}
+	return res, nil
+}
+
+// SetlistSearchResult ...
+type SetlistSearchResult struct {
+	ID   string
+	Name string
+}
+
+// SearchSetlists returns setlists whose name contains query (case-insens).
+// Always returns ID too, since names can collide.
+func (c *Client) SearchSetlists(query string) ([]SetlistSearchResult, error) {
+	items, _, _, _, err := c.FetchCurrentState()
+	if err != nil {
+		return nil, err
+	}
+	q := strings.ToLower(query)
+	var res []SetlistSearchResult
+	for _, itIface := range items {
+		it, ok := itIface.(map[string]any)
+		if !ok {
+			continue
+		}
+		if t, _ := it["type"].(float64); int(t) != 1 {
+			continue
+		}
+		data := getMap(it, "data")
+		name := getString(data, "name")
+		if strings.Contains(strings.ToLower(name), q) {
+			id := getString(it, "itemId")
+			res = append(res, SetlistSearchResult{ID: id, Name: name})
+		}
+	}
+	return res, nil
 }
