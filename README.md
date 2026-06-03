@@ -1,6 +1,6 @@
 # imslpcli
 
-A Cobra-based command-line client and Go library for IMSLP (imslp.org) using its private client-side sync API. It also ships a complete, self-contained **MCP server** (Model Context Protocol over HTTP Streaming) with built-in OAuth2 Authorization Server + Resource Server support — perfect for connecting Claude Desktop, Grok, Cursor, or other AI agents directly to your personal IMSLP library and setlists.
+A Cobra-based command-line client and Go library for IMSLP (imslp.org) using its private client-side sync API. It also ships a complete, self-contained **MCP server** (Model Context Protocol over HTTP Streaming) with built-in OAuth2 Authorization Server + Resource Server support — perfect for connecting OpenCode, Grok, Claude Desktop, Cursor, or other AI agents directly to your personal IMSLP library and setlists.
 
 ## Features
 
