@@ -1,3 +1,8 @@
+setlists.json
+scores.json
+sync.json
+sync_meta.json
+
 .env
 .env.local
 dist/

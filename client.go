@@ -1,11 +1,18 @@
 package main
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
+	"net/http/cookiejar"
+	"net/url"
 	"os"
+	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -612,3 +619,145 @@ func (c *Client) SearchSetlists(query string) ([]SetlistSearchResult, error) {
 	}
 	return res, nil
 }
+
+func (c *Client) initWebClient() {
+	if c.webClient != nil {
+		return
+	}
+	jar, _ := cookiejar.New(nil)
+	c.webClient = &http.Client{
+		Jar:     jar,
+		Timeout: 120 * time.Second,
+	}
+}
+
+// fetchURLWithBrowserHeaders performs a GET mimicking the browser curl the user
+// provided for stor.imslp.org assets (with Referer/Origin/UA/Sec-* headers).
+// It also carries cookies from the jar (loginToken when present).
+func (c *Client) fetchURLWithBrowserHeaders(u string) (*http.Response, error) {
+	c.initWebClient()
+	req, err := http.NewRequest("GET", u, nil)
+	if err != nil {
+		return nil, err
+	}
+	// Headers from the exact curl example provided for the stor PDF fetch:
+	req.Header.Set("Accept", "*/*")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9,fr;q=0.8")
+	req.Header.Set("Cache-Control", "no-cache")
+	req.Header.Set("Pragma", "no-cache")
+	req.Header.Set("Referer", "https://imslp.org/")
+	req.Header.Set("Origin", "https://imslp.org")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36")
+	req.Header.Set("sec-ch-ua", `"Chromium";v="148", "Google Chrome";v="148", "Not/A)Brand";v="99"`)
+	req.Header.Set("sec-ch-ua-mobile", "?0")
+	req.Header.Set("sec-ch-ua-platform", `"macOS"`)
+	req.Header.Set("Sec-Fetch-Dest", "empty")
+	req.Header.Set("Sec-Fetch-Mode", "cors")
+	req.Header.Set("Sec-Fetch-Site", "same-site")
+	req.Header.Set("Connection", "keep-alive")
+
+	// Also attach loginToken (as cookie) when we have it, per "curl ... with the login token".
+	if c.LoginToken != "" {
+		if parsed, perr := url.Parse(u); perr == nil && strings.HasSuffix(parsed.Host, "imslp.org") {
+			root, _ := url.Parse("https://imslp.org/")
+			c.webClient.Jar.SetCookies(root, []*http.Cookie{
+				{Name: "loginToken", Value: c.LoginToken, Path: "/", Domain: ".imslp.org"},
+			})
+		}
+	}
+
+	return c.webClient.Do(req)
+}
+
+// extractPDFURL scans a (HTML/JS) page body for a direct PDF asset URL.
+// Prefers stor.imslp.org links; falls back to other .pdf mentions (skips obvious non-assets).
+func extractPDFURL(pageBody, base string) string {
+	// direct stor links (what browser curl actually hits)
+	reStor := regexp.MustCompile(`https?://stor\.imslp\.org/[^\s"'<>]+\.pdf`)
+	if m := reStor.FindString(pageBody); m != "" {
+		return m
+	}
+	// any full URL containing stor + .pdf
+	re := regexp.MustCompile(`(https?://[^"'\s<>()]*stor[^"'\s<>()]*\.pdf[^"'\s<>()]*)`)
+	if m := re.FindStringSubmatch(pageBody); len(m) > 1 {
+		return m[1]
+	}
+	// relative paths
+	reRel := regexp.MustCompile(`["'](/[^"'\s<>()]*\.pdf[^"'\s<>()]*)["']`)
+	if m := reRel.FindStringSubmatch(pageBody); len(m) > 1 {
+		if bu, err := url.Parse(base); err == nil {
+			if ru, err := url.Parse(m[1]); err == nil {
+				return bu.ResolveReference(ru).String()
+			}
+		}
+		return m[1]
+	}
+	// broad quoted .pdf , avoid login-related
+	rePDF := regexp.MustCompile(`["']([^"']+\.pdf[^"'\s<>'"]*)["']`)
+	for _, m := range rePDF.FindAllStringSubmatch(pageBody, -1) {
+		u := m[1]
+		lu := strings.ToLower(u)
+		if strings.Contains(lu, ".pdf") && !strings.Contains(lu, "login") && !strings.Contains(lu, "icon") && !strings.Contains(lu, "logo") && !strings.Contains(lu, "spinner") {
+			if strings.HasPrefix(u, "http") {
+				return u
+			}
+			if bu, err := url.Parse(base); err == nil {
+				if ru, err := url.Parse(u); err == nil {
+					return bu.ResolveReference(ru).String()
+				}
+			}
+			return u
+		}
+	}
+	return ""
+}
+
+// downloadToFile fetches u using browser-like headers + web cookies (loginToken),
+// saves bytes to target. If the response is not a PDF (e.g. HTML viewer page),
+// it extracts an asset URL from the body and fetches that instead (the actual stor PDF).
+// This lets us "just do something like a curl on that [mylib or stor] URL".
+func (c *Client) downloadToFile(u, target string) error {
+	resp, err := c.fetchURLWithBrowserHeaders(u)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
+		return fmt.Errorf("http status %d for %s: %s", resp.StatusCode, u, string(b))
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+
+	ct := resp.Header.Get("Content-Type")
+	isPDF := strings.Contains(ct, "pdf") || bytes.HasPrefix(body, []byte("%PDF"))
+	if !isPDF {
+		// got HTML or other (viewer page); extract the real PDF asset (stor URL typically)
+		asset := extractPDFURL(string(body), u)
+		if asset == "" {
+			return fmt.Errorf("fetched %s (type=%s, %d bytes) but it was not a PDF and no stor/asset .pdf link found in response; body snippet: %.200s", u, ct, len(body), string(body))
+		}
+		if !strings.HasPrefix(asset, "http") {
+			if bu, perr := url.Parse(u); perr == nil {
+				if ru, perr := url.Parse(asset); perr == nil {
+					asset = bu.ResolveReference(ru).String()
+				}
+			}
+		}
+		// recurse to fetch the real one (with same headers + cookies)
+		return c.downloadToFile(asset, target)
+	}
+
+	// write PDF
+	if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
+		return err
+	}
+	if err := os.WriteFile(target, body, 0644); err != nil {
+		return err
+	}
+	return nil
+}
+

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"text/tabwriter"
 
@@ -517,6 +518,161 @@ var scoresSearchCmd = &cobra.Command{
 	},
 }
 
+var scoresDownloadCmd = &cobra.Command{
+	Use:   "download <idOrName>",
+	Short: "Download a score by ID or name (Work Title). If name ambiguous, lists matches with IDs and exits.",
+	Args:  cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		client := NewClient()
+		if err := client.EnsureAuth(); err != nil {
+			return err
+		}
+		ref := args[0]
+		allItems, _, _, _, err := client.FetchCurrentState()
+		if err != nil {
+			return err
+		}
+		var matches []map[string]any
+		// heuristic: looks like ID if contains '-' with left ~13 digits, right 16 alphanum
+		parts := strings.Split(ref, "-")
+		looksLikeID := len(parts) == 2 && len(parts[0]) >= 10 && len(parts[1]) == 16 && isHex(parts[1])
+		for _, itIface := range allItems {
+			it, ok := itIface.(map[string]any)
+			if !ok {
+				continue
+			}
+			if t, _ := it["type"].(float64); int(t) != 0 {
+				continue
+			}
+			sid := getString(it, "itemId")
+			if looksLikeID && sid == ref {
+				matches = append(matches, it)
+				break
+			}
+			if !looksLikeID {
+				data := getMap(it, "data")
+				title := ""
+				for _, infIface := range getAnySlice(data, "info") {
+					inf, ok := infIface.([]any)
+					if !ok || len(inf) < 2 {
+						continue
+					}
+					key := strings.ToLower(fmt.Sprintf("%v", inf[0]))
+					val := fmt.Sprintf("%v", inf[1])
+					if key == "work title" {
+						title = val
+					}
+				}
+				if title != "" && title == ref {
+					matches = append(matches, it)
+				}
+			}
+		}
+		if len(matches) == 0 {
+			return fmt.Errorf("no score found for %q (use `scores search %q` to find IDs)", ref, ref)
+		}
+		if len(matches) > 1 {
+			fmt.Printf("Ambiguous name %q, multiple matches (use ID instead):\n", ref)
+			for _, m := range matches {
+				data := getMap(m, "data")
+				title := ""
+				for _, infIface := range getAnySlice(data, "info") {
+					inf, ok := infIface.([]any)
+					if !ok || len(inf) < 2 {
+						continue
+					}
+					key := strings.ToLower(fmt.Sprintf("%v", inf[0]))
+					val := fmt.Sprintf("%v", inf[1])
+					if key == "work title" {
+						title = val
+						break
+					}
+				}
+				id := getString(m, "itemId")
+				fmt.Printf("  %s  %s\n", id, title)
+			}
+			return fmt.Errorf("ambiguous name")
+		}
+		score := matches[0]
+		data := getMap(score, "data")
+		custom := getMap(data, "custom")
+		downloadURL := getString(custom, "downloadURL")
+		title := ""
+		for _, infIface := range getAnySlice(data, "info") {
+			inf, ok := infIface.([]any)
+			if !ok || len(inf) < 2 {
+				continue
+			}
+			key := strings.ToLower(fmt.Sprintf("%v", inf[0]))
+			val := fmt.Sprintf("%v", inf[1])
+			if key == "work title" {
+				title = val
+				break
+			}
+		}
+		if title == "" {
+			title = getString(score, "itemId")
+		}
+		// determine target
+		dir, _ := cmd.Flags().GetString("directory")
+		out, _ := cmd.Flags().GetString("output")
+		var target string
+		if out != "" {
+			target = out
+		} else {
+			base := sanitizeFileName(title) + ".pdf"
+			if dir != "" {
+				target = filepath.Join(dir, base)
+			} else {
+				target = base
+			}
+		}
+		if downloadURL == "" {
+			// mylib-only / user-uploaded scores lack downloadURL in the sync data (only fileHash).
+			// Construct the stor.imslp.org path from the fileHash (content hash) exactly as
+			// the mobile/web clients do: https://stor.../uploads/shared/X/Y/Z/<hash>.pdf
+			// Then just do a curl-like GET with the browser headers + loginToken cookie.
+			fileHash := getString(custom, "fileHash")
+			if fileHash == "" || len(fileHash) < 3 {
+				return fmt.Errorf("no downloadURL for this score and no fileHash to synthesize stor PDF URL")
+			}
+			storURL := fmt.Sprintf("https://stor.imslp.org/uploads/shared/%s/%s/%s/%s.pdf",
+				fileHash[0:1], fileHash[1:2], fileHash[2:3], fileHash)
+			fmt.Printf("Downloading via constructed stor URL (from fileHash) to %s ...\n", target)
+			if err := client.downloadToFile(storURL, target); err != nil {
+				return fmt.Errorf("download failed: %w", err)
+			}
+			fmt.Printf("Downloaded to %s\n", target)
+			return nil
+		}
+		fmt.Printf("Downloading %s to %s ...\n", downloadURL, target)
+		if err := client.downloadToFile(downloadURL, target); err != nil {
+			return fmt.Errorf("download failed: %w", err)
+		}
+		fmt.Printf("Downloaded to %s\n", target)
+		return nil
+	},
+}
+
+func sanitizeFileName(s string) string {
+	// replace common invalid filename chars
+	repl := strings.NewReplacer(
+		"/", "_", "\\", "_", ":", "_", "*", "_",
+		"?", "_", "\"", "_", "<", "_", ">", "_", "|", "_",
+		"\n", " ", "\r", " ", "\t", " ",
+	)
+	return strings.TrimSpace(repl.Replace(s))
+}
+
+func isHex(s string) bool {
+	for _, c := range s {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+			return false
+		}
+	}
+	return true
+}
+
 func findSetlist(client *Client, idOrName string) (map[string]any, error) {
 	items, _, _, _, err := client.FetchCurrentState()
 	if err != nil {
@@ -586,6 +742,9 @@ func init() {
 	rootCmd.AddCommand(setlistCmd)
 
 	scoresCmd.AddCommand(scoresSearchCmd)
+	scoresCmd.AddCommand(scoresDownloadCmd)
+	scoresDownloadCmd.Flags().StringP("directory", "d", "", "directory to drop the file (default: current directory)")
+	scoresDownloadCmd.Flags().StringP("output", "o", "", "exact output path (including filename, default: <song name>.pdf)")
 	rootCmd.AddCommand(scoresCmd)
 }
 
