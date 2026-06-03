@@ -1146,7 +1146,11 @@ func (s *imslpMCPServer) toolListSetlists(ctx context.Context, req *mcp.CallTool
 	}
 	table := columnize.SimpleFormat(lines)
 	text := fmt.Sprintf("%d setlists:\n%s", len(summaries), table)
-	return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: text}}}, summaries, nil
+	structured := map[string]any{
+		"count":    len(summaries),
+		"setlists": summaries,
+	}
+	return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: text}}}, structured, nil
 }
 
 type searchSetlistsArgs struct {
@@ -1163,10 +1167,14 @@ func (s *imslpMCPServer) toolSearchSetlists(ctx context.Context, req *mcp.CallTo
 		return nil, nil, err
 	}
 	b, _ := json.MarshalIndent(results, "", "  ")
-	if len(results) == 0 {
-		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "no matches"}}}, results, nil
+	structured := map[string]any{
+		"count":   len(results),
+		"results": results,
 	}
-	return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: string(b)}}}, results, nil
+	if len(results) == 0 {
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "no matches"}}}, structured, nil
+	}
+	return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: string(b)}}}, structured, nil
 }
 
 type refArgs struct {
@@ -1422,10 +1430,14 @@ func (s *imslpMCPServer) toolSearchScores(ctx context.Context, req *mcp.CallTool
 		return nil, nil, err
 	}
 	b, _ := json.MarshalIndent(results, "", "  ")
-	if len(results) == 0 {
-		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "no matches"}}}, results, nil
+	structured := map[string]any{
+		"count":   len(results),
+		"results": results,
 	}
-	return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: string(b)}}}, results, nil
+	if len(results) == 0 {
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "no matches"}}}, structured, nil
+	}
+	return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: string(b)}}}, structured, nil
 }
 
 type scoreRefArgs struct {
