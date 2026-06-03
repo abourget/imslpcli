@@ -120,6 +120,84 @@ func (r *clientRegistry) get(clientID string) (registeredClient, bool) {
 	return c, ok
 }
 
+type persistedSession struct {
+	UserID string `json:"userID"`
+}
+
+type sessionRegistry struct {
+	mu       sync.RWMutex
+	sessions map[string]persistedSession
+	filePath string
+}
+
+func newSessionRegistry(filePath string) *sessionRegistry {
+	if filePath == "" {
+		filePath = "mcp-sessions.json"
+	}
+	reg := &sessionRegistry{
+		sessions: make(map[string]persistedSession),
+		filePath: filePath,
+	}
+	reg.load()
+	return reg
+}
+
+func (r *sessionRegistry) load() {
+	data, err := os.ReadFile(r.filePath)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			log.Printf("warning: failed to read sessions file %s: %v", r.filePath, err)
+		}
+		return
+	}
+	var m map[string]persistedSession
+	if err := json.Unmarshal(data, &m); err != nil {
+		log.Printf("warning: failed to parse sessions file %s: %v", r.filePath, err)
+		return
+	}
+	r.mu.Lock()
+	r.sessions = m
+	r.mu.Unlock()
+	log.Printf("loaded %d persisted MCP sessions from %s", len(m), r.filePath)
+}
+
+func (r *sessionRegistry) save() {
+	r.mu.RLock()
+	data, _ := json.MarshalIndent(r.sessions, "", "  ")
+	r.mu.RUnlock()
+
+	tmp := r.filePath + ".tmp"
+	if err := os.WriteFile(tmp, data, 0600); err != nil {
+		log.Printf("warning: failed to write temp sessions file %s: %v", tmp, err)
+		return
+	}
+	if err := os.Rename(tmp, r.filePath); err != nil {
+		log.Printf("warning: failed to atomically update sessions file %s: %v", r.filePath, err)
+		return
+	}
+}
+
+func (r *sessionRegistry) put(sessionID string, sess persistedSession) {
+	r.mu.Lock()
+	r.sessions[sessionID] = sess
+	r.mu.Unlock()
+	r.save()
+}
+
+func (r *sessionRegistry) get(sessionID string) (persistedSession, bool) {
+	r.mu.RLock()
+	s, ok := r.sessions[sessionID]
+	r.mu.RUnlock()
+	return s, ok
+}
+
+func (r *sessionRegistry) remove(sessionID string) {
+	r.mu.Lock()
+	delete(r.sessions, sessionID)
+	r.mu.Unlock()
+	r.save()
+}
+
 // statusWriter captures the HTTP status code for access logging.
 type statusWriter struct {
 	http.ResponseWriter
@@ -248,13 +326,15 @@ type imslpMCPServer struct {
 	jwtSecret []byte
 	mcpSrv    *mcp.Server
 	clients   *clientRegistry
+	sessions  *sessionRegistry
 }
 
-func newIMSLPMCPServer(baseURL string, jwtSecret []byte, clientsFile string) *imslpMCPServer {
+func newIMSLPMCPServer(baseURL string, jwtSecret []byte, clientsFile, sessionsFile string) *imslpMCPServer {
 	s := &imslpMCPServer{
 		baseURL:   strings.TrimRight(baseURL, "/"),
 		jwtSecret: jwtSecret,
 		clients:   newClientRegistry(clientsFile),
+		sessions:  newSessionRegistry(sessionsFile),
 	}
 	s.mcpSrv = s.createMCPServer()
 	return s
@@ -358,9 +438,10 @@ func setCORS(w http.ResponseWriter, allowedMethods string) {
 // 401 vs 403 cases and session user mismatches.
 func (s *imslpMCPServer) mcpDebugWrapper(inner http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		sessID := r.Header.Get("Mcp-Session-Id")
-		if len(sessID) > 12 {
-			sessID = sessID[:12] + "..."
+		fullSessID := r.Header.Get("Mcp-Session-Id")
+		logSessID := fullSessID
+		if len(logSessID) > 12 {
+			logSessID = logSessID[:12] + "..."
 		}
 		ti := auth.TokenInfoFromContext(r.Context())
 		tokenUser := ""
@@ -372,13 +453,55 @@ func (s *imslpMCPServer) mcpDebugWrapper(inner http.Handler) http.Handler {
 				}
 			}
 		}
-		log.Printf("MCP post-auth: path=%s session=%s token_user=%s", r.URL.Path, sessID, tokenUser)
+		log.Printf("MCP post-auth: path=%s session=%s token_user=%s", r.URL.Path, logSessID, tokenUser)
+
+		// Check persisted session binding (loaded on boot from --sessions-file) so that
+		// a server reboot does not let other users hijack stale Mcp-Session-Ids (the
+		// binding is the persisted equivalent of the SDK's in-memory userID guard).
+		// Only the recorded owner may use/refresh the sessionID. We (re)write on every
+		// use so the on-disk copy is current.
+		if fullSessID != "" && tokenUser != "" {
+			if ps, ok := s.sessions.get(fullSessID); ok && ps.UserID != tokenUser {
+				log.Printf("MCP returning 403 (persisted session user mismatch for session=%s persisted_user=%s token_user=%s)", logSessID, ps.UserID, tokenUser)
+				http.Error(w, "session user mismatch", http.StatusForbidden)
+				return
+			}
+			s.sessions.put(fullSessID, persistedSession{UserID: tokenUser})
+		}
 
 		// Wrap to detect 403s returned from inside the stream handler (e.g. session user mismatch)
 		sw := &statusWriter{ResponseWriter: w, status: 200}
 		inner.ServeHTTP(sw, r)
 		if sw.status == 403 {
-			log.Printf("MCP returning 403 (likely session user mismatch for session=%s token_user=%s)", sessID, tokenUser)
+			log.Printf("MCP returning 403 (likely session user mismatch for session=%s token_user=%s)", logSessID, tokenUser)
+		}
+
+		// On explicit session close (DELETE), drop from our persisted registry too so the
+		// on-disk sessions don't accumulate closed ones forever.
+		if r.Method == http.MethodDelete && sw.status == http.StatusNoContent {
+			sid := fullSessID
+			if sid != "" {
+				s.sessions.remove(sid)
+				log.Printf("MCP removed closed session=%s (persisted cleaned)", sid)
+			}
+		}
+
+		// Also persist when the server *assigns* a new session ID in the response (happens on
+		// initialize for brand new sessions). This ensures the binding is on disk immediately
+		// after the client is told its Mcp-Session-Id, even before any follow-up request.
+		if assigned := w.Header().Get("Mcp-Session-Id"); assigned != "" && tokenUser != "" {
+			wasNew := false
+			if _, ok := s.sessions.get(assigned); !ok {
+				wasNew = true
+			}
+			if ps, ok := s.sessions.get(assigned); ok && ps.UserID != tokenUser {
+				log.Printf("MCP assigned session=%s but persisted owner mismatch (user=%s vs %s)", assigned, ps.UserID, tokenUser)
+			} else {
+				s.sessions.put(assigned, persistedSession{UserID: tokenUser})
+				if wasNew {
+					log.Printf("MCP persisted newly assigned session=%s for user=%s", assigned, tokenUser)
+				}
+			}
 		}
 	})
 }

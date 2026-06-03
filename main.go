@@ -686,7 +686,7 @@ var mcpCmd = &cobra.Command{
 - OAuth 2.0 Authorization Server (/.well-known/oauth-authorization-server, /authorize with IMSLP login/pass HTML form, /token for PKCE exchange returning JWT, /register for DCR)
 - MCP Resource Server (/mcp) using streamable HTTP; all tool calls authenticated via the Bearer JWT (which embeds the user's IMSLP loginToken for backend calls).
 
-Clients (Claude Desktop, etc.) perform standard discovery from the MCP URL's 401 WWW-Authenticate, auto DCR if needed, redirect user to /authorize for the login form, obtain JWT, and use it. No client secrets or pre-registration required from the human operator. Registered clients and JWT signing secret are persisted to disk (mcp-clients.json and mcp-jwt-secret.key by default) so flows survive restarts.
+Clients (Claude Desktop, etc.) perform standard discovery from the MCP URL's 401 WWW-Authenticate, auto DCR if needed, redirect user to /authorize for the login form, obtain JWT, and use it. No client secrets or pre-registration required from the human operator. Registered clients, MCP sessions (Mcp-Session-Id bindings), and JWT signing secret are persisted to disk (mcp-clients.json, mcp-sessions.json, mcp-jwt-secret.key by default) so flows and sessions survive restarts.
 
 Use --base-url (or APP_BASE_URL env) when hosting publicly (e.g. https://imslp-mcp.exe.xyz). Provide a stable JWT secret via --jwt-secret, IMSLP_MCP_JWT_SECRET env, or let it be persisted to --jwt-secret-file (default: mcp-jwt-secret.key) so tokens survive restarts.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
@@ -707,7 +707,8 @@ Use --base-url (or APP_BASE_URL env) when hosting publicly (e.g. https://imslp-m
 		}
 		addr := fmt.Sprintf("%s:%d", host, port)
 		clientsFile, _ := cmd.Flags().GetString("clients-file")
-		s := newIMSLPMCPServer(baseURL, secret, clientsFile)
+		sessionsFile, _ := cmd.Flags().GetString("sessions-file")
+		s := newIMSLPMCPServer(baseURL, secret, clientsFile, sessionsFile)
 		mux := http.NewServeMux()
 		handler := s.registerHandlers(mux)
 		log.Printf("IMSLP MCP (AS+RS) listening on http://%s", addr)
@@ -715,6 +716,7 @@ Use --base-url (or APP_BASE_URL env) when hosting publicly (e.g. https://imslp-m
 		log.Printf("  Connect MCP clients to: %s/mcp", baseURL)
 		log.Printf("  OAuth AS metadata: %s/.well-known/oauth-authorization-server", baseURL)
 		log.Printf("  Persisted clients file: %s", clientsFile)
+		log.Printf("  Persisted sessions file: %s", sessionsFile)
 		log.Printf("  JWT secret file: %s (used for persistent signing key)", jwtSecretFile)
 		return http.ListenAndServe(addr, handler)
 	},
@@ -933,6 +935,7 @@ func init() {
 	mcpCmd.Flags().String("jwt-secret", "", "HMAC secret for signing/verifying the issued JWTs (long random string). Falls back to IMSLP_MCP_JWT_SECRET env var, then the file specified by --jwt-secret-file.")
 	mcpCmd.Flags().String("jwt-secret-file", "mcp-jwt-secret.key", "path to file for the persistent JWT signing secret (HMAC). If --jwt-secret and IMSLP_MCP_JWT_SECRET are unset, the secret is loaded from this file (or a new 32-byte secret is generated and saved here on first boot). This ensures tokens survive server restarts.")
 	mcpCmd.Flags().String("clients-file", "mcp-clients.json", "path to JSON file used as persistent store for dynamically registered OAuth clients (via DCR at /register). Clients survive server restarts so in-progress flows don't need to re-register.")
+	mcpCmd.Flags().String("sessions-file", "mcp-sessions.json", "path to JSON file used as persistent store for MCP sessions (Mcp-Session-Id to user bindings). Sessions survive server restarts.")
 	rootCmd.AddCommand(mcpCmd)
 }
 
