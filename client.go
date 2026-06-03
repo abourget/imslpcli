@@ -180,6 +180,63 @@ func (c *Client) SyncPut(items []any) (map[string]any, error) {
 	return out, err
 }
 
+// FetchCurrentState performs a full sync starting from revision 0, paging through
+// all history (following revision cursors until remaining==0), then returns only
+// the current (non-deleted) items. This gives the complete up-to-date library
+// instead of just one page of the change log.
+func (c *Client) FetchCurrentState() (currentItems []any, finalPos, finalMaj, finalReq int, err error) {
+	itemMap := map[string]map[string]any{}
+	pos, req, maj := 0, 0, 0
+	for {
+		data, err := c.SyncGet(pos, req, maj)
+		if err != nil {
+			return nil, 0, 0, 0, err
+		}
+		if itemsIface, ok := data["items"].([]any); ok {
+			for _, itIface := range itemsIface {
+				if it, ok := itIface.(map[string]any); ok {
+					if id, ok := it["itemId"].(string); ok && id != "" {
+						// later revisions (higher in the log) win
+						itemMap[id] = it
+					}
+				}
+			}
+		}
+		if v, ok := data["revisionPosition"].(float64); ok {
+			pos = int(v)
+		}
+		if v, ok := data["revisionMajor"].(float64); ok {
+			maj = int(v)
+		}
+		if v, ok := data["revisionRequested"].(float64); ok {
+			req = int(v)
+		}
+		rem := 0.0
+		if v, ok := data["remaining"].(float64); ok {
+			rem = v
+		}
+		if rem <= 0 {
+			break
+		}
+	}
+	// materialize current non-deleted items
+	for _, it := range itemMap {
+		isDeleted := false
+		if v, ok := it["isDeleted"]; ok {
+			switch vv := v.(type) {
+			case float64:
+				isDeleted = vv != 0
+			case bool:
+				isDeleted = vv
+			}
+		}
+		if !isDeleted {
+			currentItems = append(currentItems, it)
+		}
+	}
+	return currentItems, pos, maj, req, nil
+}
+
 // SaveTokenToEnv writes (or updates) the IMSLP_LOGIN_TOKEN in .env .
 // Sensitive material (token) is persisted here as requested.
 func SaveTokenToEnv(token string) error {

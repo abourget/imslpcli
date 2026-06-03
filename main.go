@@ -94,53 +94,59 @@ func keys(m map[string]any) []string {
 
 var syncCmd = &cobra.Command{
 	Use:   "sync",
-	Short: "Sync local state (placeholder - fetches latest items)",
+	Short: "Sync local state (full history to get current scores + setlists)",
 	RunE: func(cmd *cobra.Command, args []string) error {
 		client := NewClient()
 		if err := client.EnsureAuth(); err != nil {
 			return err
 		}
 
-		data, err := client.SyncGet(0, 0, 0)
+		fmt.Println("Performing full sync (paging history until caught up)...")
+		currentItems, finalPos, finalMaj, finalReq, err := client.FetchCurrentState()
 		if err != nil {
 			return err
 		}
-		fmt.Printf("sync.get returned keys: %v\n", keys(data))
-		if items, ok := data["items"].([]any); ok {
-			fmt.Printf("items count: %d\n", len(items))
-		}
+		fmt.Printf("Full sync complete. %d current (non-deleted) items. final rev pos=%d maj=%d req=%d\n",
+			len(currentItems), finalPos, finalMaj, finalReq)
 
-		// Persist as per README: simple .json snapshots of the sync data.
-		// Later: incremental updates + local mutations + sync.put
-		if b, err := json.MarshalIndent(data, "", "  "); err == nil {
-			_ = os.WriteFile("sync.json", b, 0644)
-			fmt.Println("Wrote sync.json")
-		}
-
-		// Separate scores (type 0) and setlists (type 1) for convenience
+		// Separate scores (type 0) and setlists (type 1)
 		var scores, setlists []any
-		if items, ok := data["items"].([]any); ok {
-			for _, it := range items {
-				if m, ok := it.(map[string]any); ok {
-					if t, ok := m["type"].(float64); ok {
-						switch int(t) {
-						case 0:
-							scores = append(scores, it)
-						case 1:
-							setlists = append(setlists, it)
-						}
+		for _, it := range currentItems {
+			if m, ok := it.(map[string]any); ok {
+				if t, ok := m["type"].(float64); ok {
+					switch int(t) {
+					case 0:
+						scores = append(scores, it)
+					case 1:
+						setlists = append(setlists, it)
 					}
 				}
 			}
 		}
+		fmt.Printf("Current scores: %d , setlists: %d\n", len(scores), len(setlists))
+
+		// Write the materialized current views (these should have "data" for active items)
 		if b, _ := json.MarshalIndent(scores, "", "  "); len(b) > 2 {
 			_ = os.WriteFile("scores.json", b, 0644)
-			fmt.Printf("Wrote scores.json (%d items)\n", len(scores))
+			fmt.Printf("Wrote scores.json (%d current items)\n", len(scores))
 		}
 		if b, _ := json.MarshalIndent(setlists, "", "  "); len(b) > 2 {
 			_ = os.WriteFile("setlists.json", b, 0644)
-			fmt.Printf("Wrote setlists.json (%d items)\n", len(setlists))
+			fmt.Printf("Wrote setlists.json (%d current items)\n", len(setlists))
 		}
+
+		// Also write a small snapshot of the final cursors for future incremental sync (not implemented yet)
+		meta := map[string]any{
+			"revisionPosition":  finalPos,
+			"revisionMajor":     finalMaj,
+			"revisionRequested": finalReq,
+			"numScores":         len(scores),
+			"numSetlists":       len(setlists),
+		}
+		if b, _ := json.MarshalIndent(meta, "", "  "); len(b) > 2 {
+			_ = os.WriteFile("sync_meta.json", b, 0644)
+		}
+
 		return nil
 	},
 }
