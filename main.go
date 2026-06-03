@@ -1,8 +1,11 @@
 package main
 
 import (
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
+	"log"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -669,6 +672,54 @@ var scoresShowCmd = &cobra.Command{
 	},
 }
 
+// mcpCmd starts the combined Authorization Server + Resource Server for exposing
+// all imslpcli functionality over MCP (streamable HTTP) with a built-in OAuth2
+// login flow (username/pass HTML form -> real IMSLP login -> short code -> JWT
+// containing the loginToken). Designed for hosted multi-tenant use with Claude,
+// Grok, etc. Discovery + DCR + PKCE means clients need no pre-configuration.
+// The public identity (for metadata, JWT iss/aud, links) comes from --base-url,
+// APP_BASE_URL env, or defaults to http://localhost:PORT.
+var mcpCmd = &cobra.Command{
+	Use:   "mcp",
+	Short: "Start MCP server (HTTP streaming) with OAuth2 AS+RS (login form + JWTs for per-user IMSLP access)",
+	Long: `Runs a single HTTP server that is simultaneously:
+- OAuth 2.0 Authorization Server (/.well-known/oauth-authorization-server, /authorize with IMSLP login/pass HTML form, /token for PKCE exchange returning JWT, /register for DCR)
+- MCP Resource Server (/mcp) using streamable HTTP; all tool calls authenticated via the Bearer JWT (which embeds the user's IMSLP loginToken for backend calls).
+
+Clients (Claude Desktop, etc.) perform standard discovery from the MCP URL's 401 WWW-Authenticate, auto DCR if needed, redirect user to /authorize for the login form, obtain JWT, and use it. No client secrets or pre-registration required from the human operator. Registered clients and JWT signing secret are persisted to disk (mcp-clients.json and mcp-jwt-secret.key by default) so flows survive restarts.
+
+Use --base-url (or APP_BASE_URL env) when hosting publicly (e.g. https://imslp-mcp.exe.xyz). Provide a stable JWT secret via --jwt-secret, IMSLP_MCP_JWT_SECRET env, or let it be persisted to --jwt-secret-file (default: mcp-jwt-secret.key) so tokens survive restarts.`,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		port, _ := cmd.Flags().GetInt("port")
+		host, _ := cmd.Flags().GetString("host")
+		baseURL, _ := cmd.Flags().GetString("base-url")
+		jwtSec, _ := cmd.Flags().GetString("jwt-secret")
+		jwtSecretFile, _ := cmd.Flags().GetString("jwt-secret-file")
+		if baseURL == "" {
+			baseURL = os.Getenv("APP_BASE_URL")
+		}
+		if baseURL == "" {
+			baseURL = fmt.Sprintf("http://localhost:%d", port)
+		}
+		secret, err := loadOrGenerateJWTSecret(jwtSec, os.Getenv("IMSLP_MCP_JWT_SECRET"), jwtSecretFile)
+		if err != nil {
+			return fmt.Errorf("failed to obtain JWT secret: %w", err)
+		}
+		addr := fmt.Sprintf("%s:%d", host, port)
+		clientsFile, _ := cmd.Flags().GetString("clients-file")
+		s := newIMSLPMCPServer(baseURL, secret, clientsFile)
+		mux := http.NewServeMux()
+		handler := s.registerHandlers(mux)
+		log.Printf("IMSLP MCP (AS+RS) listening on http://%s", addr)
+		log.Printf("  Public base (for metadata): %s", baseURL)
+		log.Printf("  Connect MCP clients to: %s/mcp", baseURL)
+		log.Printf("  OAuth AS metadata: %s/.well-known/oauth-authorization-server", baseURL)
+		log.Printf("  Persisted clients file: %s", clientsFile)
+		log.Printf("  JWT secret file: %s (used for persistent signing key)", jwtSecretFile)
+		return http.ListenAndServe(addr, handler)
+	},
+}
+
 func sanitizeFileName(s string) string {
 	// replace common invalid filename chars
 	repl := strings.NewReplacer(
@@ -771,7 +822,8 @@ func findScore(client *Client, idOrName string) (map[string]any, error) {
 		return nil, fmt.Errorf("no score found for %q (use `scores search %q` to find IDs)", idOrName, idOrName)
 	}
 	if len(matches) > 1 {
-		fmt.Printf("Ambiguous name %q, multiple matches (use ID instead):\n", idOrName)
+		var lines []string
+		lines = append(lines, fmt.Sprintf("Ambiguous name %q, multiple matches (use ID instead):", idOrName))
 		for _, m := range matches {
 			data := getMap(m, "data")
 			title := ""
@@ -788,9 +840,13 @@ func findScore(client *Client, idOrName string) (map[string]any, error) {
 				}
 			}
 			id := getString(m, "itemId")
-			fmt.Printf("  %s  %s\n", id, title)
+			lines = append(lines, fmt.Sprintf("  %s  %s", id, title))
 		}
-		return nil, fmt.Errorf("ambiguous name")
+		// For CLI this also prints (kept for compatibility), for MCP the error carries details.
+		for _, l := range lines {
+			fmt.Println(l)
+		}
+		return nil, fmt.Errorf("%s", strings.Join(lines, "\n"))
 	}
 	return matches[0], nil
 }
@@ -869,6 +925,53 @@ func init() {
 	scoresDownloadCmd.Flags().StringP("directory", "d", "", "directory to drop the file (default: current directory)")
 	scoresDownloadCmd.Flags().StringP("output", "o", "", "exact output path (including filename, default: <song name>.pdf)")
 	rootCmd.AddCommand(scoresCmd)
+
+	// mcp server command (AS + RS)
+	mcpCmd.Flags().Int("port", 8080, "TCP port to listen on")
+	mcpCmd.Flags().String("host", "0.0.0.0", "host address to bind (use 127.0.0.1 to restrict to local)")
+	mcpCmd.Flags().String("base-url", "", "canonical public base URL used in OAuth metadata, authorize redirects, JWT iss/aud, and resource identifiers (e.g. https://imslp-mcp.example.com). If not set, falls back to APP_BASE_URL env var, then http://localhost:PORT.")
+	mcpCmd.Flags().String("jwt-secret", "", "HMAC secret for signing/verifying the issued JWTs (long random string). Falls back to IMSLP_MCP_JWT_SECRET env var, then the file specified by --jwt-secret-file.")
+	mcpCmd.Flags().String("jwt-secret-file", "mcp-jwt-secret.key", "path to file for the persistent JWT signing secret (HMAC). If --jwt-secret and IMSLP_MCP_JWT_SECRET are unset, the secret is loaded from this file (or a new 32-byte secret is generated and saved here on first boot). This ensures tokens survive server restarts.")
+	mcpCmd.Flags().String("clients-file", "mcp-clients.json", "path to JSON file used as persistent store for dynamically registered OAuth clients (via DCR at /register). Clients survive server restarts so in-progress flows don't need to re-register.")
+	rootCmd.AddCommand(mcpCmd)
+}
+
+// loadOrGenerateJWTSecret returns the secret to use for HMAC-SHA256 JWT signing.
+// Priority: --jwt-secret flag > IMSLP_MCP_JWT_SECRET env > file at jwtSecretFile
+// (load if exists, else generate 32 random bytes, save atomically with 0600 perms, and return it).
+func loadOrGenerateJWTSecret(flagSecret, envSecret, jwtSecretFile string) ([]byte, error) {
+	if flagSecret != "" {
+		return []byte(flagSecret), nil
+	}
+	if envSecret != "" {
+		return []byte(envSecret), nil
+	}
+
+	// Try to load from persistent file
+	if data, err := os.ReadFile(jwtSecretFile); err == nil && len(data) >= 16 {
+		log.Printf("Loaded persistent JWT secret from %s (tokens will survive restarts)", jwtSecretFile)
+		return data, nil
+	} else if err != nil && !os.IsNotExist(err) {
+		return nil, fmt.Errorf("failed to read JWT secret file %s: %w", jwtSecretFile, err)
+	}
+
+	// Generate new secret
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return nil, fmt.Errorf("failed to generate JWT secret: %w", err)
+	}
+
+	// Atomic write
+	tmp := jwtSecretFile + ".tmp"
+	if err := os.WriteFile(tmp, b, 0600); err != nil {
+		return nil, fmt.Errorf("failed to write temporary JWT secret file: %w", err)
+	}
+	if err := os.Rename(tmp, jwtSecretFile); err != nil {
+		return nil, fmt.Errorf("failed to install JWT secret file %s: %w", jwtSecretFile, err)
+	}
+
+	log.Printf("Generated new persistent JWT secret and saved to %s (use --jwt-secret or IMSLP_MCP_JWT_SECRET to override on future runs)", jwtSecretFile)
+	return b, nil
 }
 
 func main() {

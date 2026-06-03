@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/joho/godotenv"
+	"github.com/modelcontextprotocol/go-sdk/auth"
 	"resty.dev/v3"
 )
 
@@ -44,6 +45,26 @@ func NewClient() *Client {
 		LoginToken: os.Getenv("IMSLP_LOGIN_TOKEN"),
 	}
 	return c
+}
+
+// NewClientWithToken returns a client authenticated with the provided IMSLP login token
+// (used by the MCP server to serve per-user sessions from OAuth JWTs).
+func NewClientWithToken(token string) *Client {
+	c := NewClient()
+	c.LoginToken = token
+	return c
+}
+
+// IMSLPLoginTokenFromTokenInfo extracts the embedded IMSLP login token from
+// the MCP RequestExtra.TokenInfo (our custom claim from the issued JWT).
+func IMSLPLoginTokenFromTokenInfo(ti *auth.TokenInfo) string {
+	if ti == nil || ti.Extra == nil {
+		return ""
+	}
+	if v, ok := ti.Extra["imslp_login_token"].(string); ok && v != "" {
+		return v
+	}
+	return ""
 }
 
 // EnsureAuth ensures we have a LoginToken. If none but IMSLP_USERNAME/IMSLP_PASSWORD
