@@ -6,9 +6,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"text/tabwriter"
 
 	"github.com/joho/godotenv"
+	"github.com/ryanuber/columnize"
 	"github.com/spf13/cobra"
 )
 
@@ -185,18 +185,18 @@ var setlistListCmd = &cobra.Command{
 		b, _ := json.MarshalIndent(lists, "", "  ")
 		_ = os.WriteFile("setlists.json", b, 0644)
 		fmt.Printf("%d setlists:\n", len(lists))
-		w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-		fmt.Fprintln(w, "ID\tNAME\tITEMS")
+		var lines []string
+		lines = append(lines, "ID|NAME|ITEMS")
 		for _, l := range lists {
 			if m, ok := l.(map[string]any); ok {
 				data := getMap(m, "data")
 				id := getString(m, "itemId")
 				name := getString(data, "name")
 				n := len(getAnySlice(data, "items"))
-				fmt.Fprintf(w, "%s\t%s\t%d\n", id, name, n)
+				lines = append(lines, fmt.Sprintf("%s|%s|%d", id, name, n))
 			}
 		}
-		w.Flush()
+		fmt.Println(columnize.SimpleFormat(lines))
 		return nil
 	},
 }
@@ -475,17 +475,17 @@ var setlistShowCmd = &cobra.Command{
 			}
 		}
 		fmt.Printf("Setlist %s (%s) has %d scores:\n", name, id, len(scoreIDs))
-		w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-		fmt.Fprintln(w, "ID\tTITLE")
+		var lines []string
+		lines = append(lines, "ID|TITLE")
 		for _, sidIface := range scoreIDs {
 			sid := fmt.Sprintf("%v", sidIface)
 			title := scoreTitles[sid]
 			if title == "" {
 				title = "(not found / deleted?)"
 			}
-			fmt.Fprintf(w, "%s\t%s\n", sid, title)
+			lines = append(lines, fmt.Sprintf("%s|%s", sid, title))
 		}
-		w.Flush()
+		fmt.Println(columnize.SimpleFormat(lines))
 		return nil
 	},
 }
@@ -497,7 +497,7 @@ var scoresCmd = &cobra.Command{
 
 var scoresSearchCmd = &cobra.Command{
 	Use:   "search <query>",
-	Short: "Search scores (by Work Title or other info), prints ID and Work Title",
+	Short: "Search scores (by Work Title or other info), prints ID, Work Title, Composer and Title",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		client := NewClient()
@@ -508,12 +508,16 @@ var scoresSearchCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
-		for _, r := range results {
-			fmt.Printf("%s\t%s\n", r.ID, r.Title)
-		}
 		if len(results) == 0 {
 			fmt.Println("no matches")
+			return nil
 		}
+		var lines []string
+		lines = append(lines, "ID|WORK TITLE|COMPOSER|TITLE")
+		for _, r := range results {
+			lines = append(lines, fmt.Sprintf("%s|%s|%s|%s", r.ID, r.WorkTitle, r.Composer, r.Title))
+		}
+		fmt.Println(columnize.SimpleFormat(lines))
 		return nil
 	},
 }
@@ -528,72 +532,10 @@ var scoresDownloadCmd = &cobra.Command{
 			return err
 		}
 		ref := args[0]
-		allItems, _, _, _, err := client.FetchCurrentState()
+		score, err := findScore(client, ref)
 		if err != nil {
 			return err
 		}
-		var matches []map[string]any
-		// heuristic: looks like ID if contains '-' with left ~13 digits, right 16 alphanum
-		parts := strings.Split(ref, "-")
-		looksLikeID := len(parts) == 2 && len(parts[0]) >= 10 && len(parts[1]) == 16 && isHex(parts[1])
-		for _, itIface := range allItems {
-			it, ok := itIface.(map[string]any)
-			if !ok {
-				continue
-			}
-			if t, _ := it["type"].(float64); int(t) != 0 {
-				continue
-			}
-			sid := getString(it, "itemId")
-			if looksLikeID && sid == ref {
-				matches = append(matches, it)
-				break
-			}
-			if !looksLikeID {
-				data := getMap(it, "data")
-				title := ""
-				for _, infIface := range getAnySlice(data, "info") {
-					inf, ok := infIface.([]any)
-					if !ok || len(inf) < 2 {
-						continue
-					}
-					key := strings.ToLower(fmt.Sprintf("%v", inf[0]))
-					val := fmt.Sprintf("%v", inf[1])
-					if key == "work title" {
-						title = val
-					}
-				}
-				if title != "" && title == ref {
-					matches = append(matches, it)
-				}
-			}
-		}
-		if len(matches) == 0 {
-			return fmt.Errorf("no score found for %q (use `scores search %q` to find IDs)", ref, ref)
-		}
-		if len(matches) > 1 {
-			fmt.Printf("Ambiguous name %q, multiple matches (use ID instead):\n", ref)
-			for _, m := range matches {
-				data := getMap(m, "data")
-				title := ""
-				for _, infIface := range getAnySlice(data, "info") {
-					inf, ok := infIface.([]any)
-					if !ok || len(inf) < 2 {
-						continue
-					}
-					key := strings.ToLower(fmt.Sprintf("%v", inf[0]))
-					val := fmt.Sprintf("%v", inf[1])
-					if key == "work title" {
-						title = val
-						break
-					}
-				}
-				id := getString(m, "itemId")
-				fmt.Printf("  %s  %s\n", id, title)
-			}
-			return fmt.Errorf("ambiguous name")
-		}
-		score := matches[0]
 		data := getMap(score, "data")
 		custom := getMap(data, "custom")
 		downloadURL := getString(custom, "downloadURL")
@@ -628,28 +570,101 @@ var scoresDownloadCmd = &cobra.Command{
 			}
 		}
 		if downloadURL == "" {
-			// mylib-only / user-uploaded scores lack downloadURL in the sync data (only fileHash).
-			// Construct the stor.imslp.org path from the fileHash (content hash) exactly as
-			// the mobile/web clients do: https://stor.../uploads/shared/X/Y/Z/<hash>.pdf
-			// Then just do a curl-like GET with the browser headers + loginToken cookie.
+			// mylib-only/user-uploaded scores (the ones that only appear under /mylib/)
+			// have no downloadURL in the sync data, but they *do* have fileHash.
+			// We construct the stor.imslp.org URL directly from it and fetch plain.
+			// (These stor links work completely unauthenticated; no token/cookies/headers/HTML needed.)
 			fileHash := getString(custom, "fileHash")
 			if fileHash == "" || len(fileHash) < 3 {
 				return fmt.Errorf("no downloadURL for this score and no fileHash to synthesize stor PDF URL")
 			}
-			storURL := fmt.Sprintf("https://stor.imslp.org/uploads/shared/%s/%s/%s/%s.pdf",
+			downloadURL = fmt.Sprintf("https://stor.imslp.org/uploads/shared/%s/%s/%s/%s.pdf",
 				fileHash[0:1], fileHash[1:2], fileHash[2:3], fileHash)
-			fmt.Printf("Downloading via constructed stor URL (from fileHash) to %s ...\n", target)
-			if err := client.downloadToFile(storURL, target); err != nil {
-				return fmt.Errorf("download failed: %w", err)
-			}
-			fmt.Printf("Downloaded to %s\n", target)
-			return nil
 		}
 		fmt.Printf("Downloading %s to %s ...\n", downloadURL, target)
-		if err := client.downloadToFile(downloadURL, target); err != nil {
+		if err := DownloadFile(downloadURL, target); err != nil {
 			return fmt.Errorf("download failed: %w", err)
 		}
 		fmt.Printf("Downloaded to %s\n", target)
+		return nil
+	},
+}
+
+var scoresShowCmd = &cobra.Command{
+	Use:   "show <idOrName>",
+	Short: "Show detailed info for a score by ID or Work Title (ambiguous names list matches with IDs)",
+	Args:  cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		client := NewClient()
+		if err := client.EnsureAuth(); err != nil {
+			return err
+		}
+		ref := args[0]
+		score, err := findScore(client, ref)
+		if err != nil {
+			return err
+		}
+		data := getMap(score, "data")
+		custom := getMap(data, "custom")
+		itemID := getString(score, "itemId")
+
+		var entries []struct{ key, val string }
+		entries = append(entries, struct{key, val string}{"ID", itemID})
+
+		// core top-level record fields (format integers without scientific notation for readability)
+		for _, k := range []string{"createdAt", "updatedAt", "revision", "userId", "type", "isDeleted", "fileItemId"} {
+			raw := score[k]
+			v := fmt.Sprintf("%v", raw)
+			if f, ok := raw.(float64); ok {
+				if f == float64(int64(f)) {
+					v = fmt.Sprintf("%d", int64(f))
+				} else {
+					// force full digits, no e+ notation for large timestamps etc.
+					v = fmt.Sprintf("%.0f", f)
+				}
+			}
+			if v == "<nil>" {
+				v = "(null)"
+			}
+			entries = append(entries, struct{key, val string}{k, v})
+		}
+
+		// the song metadata from the info array (preserves original order)
+		for _, infIface := range getAnySlice(data, "info") {
+			inf, ok := infIface.([]any)
+			if !ok || len(inf) < 2 {
+				continue
+			}
+			k := fmt.Sprintf("%v", inf[0])
+			v := fmt.Sprintf("%v", inf[1])
+			entries = append(entries, struct{key, val string}{k, v})
+		}
+
+		// custom storage fields (fileHash always present for asset location)
+		for _, ck := range []string{"fileHash", "downloadURL", "filePath"} {
+			cv := getString(custom, ck)
+			entries = append(entries, struct{key, val string}{ck, cv})
+		}
+
+		// always derive + show the direct Download URL (the stor one, works unauthenticated)
+		fileHash := getString(custom, "fileHash")
+		stor := "(unavailable - no fileHash)"
+		if len(fileHash) >= 3 {
+			stor = fmt.Sprintf("https://stor.imslp.org/uploads/shared/%s/%s/%s/%s.pdf",
+				fileHash[0:1], fileHash[1:2], fileHash[2:3], fileHash)
+		}
+		entries = append(entries, struct{key, val string}{"Download URL", stor})
+
+		// print everything aligned; special handling for multiline values (Lyrics, Publisher, Copyright, etc.)
+		maxW := 0
+		for _, e := range entries {
+			if l := runeLen(e.key); l > maxW {
+				maxW = l
+			}
+		}
+		for _, e := range entries {
+			printKeyValue(e.key, e.val, maxW)
+		}
 		return nil
 	},
 }
@@ -671,6 +686,113 @@ func isHex(s string) bool {
 		}
 	}
 	return true
+}
+
+// runeLen counts unicode codepoints for proper alignment/padding (handles UTF-8
+// accents etc. that tabwriter had trouble with).
+func runeLen(s string) int {
+	l := 0
+	for range s {
+		l++
+	}
+	return l
+}
+
+// printKeyValue prints "KEY: value" with keys left-aligned to maxW.
+// For values containing \n (e.g. Lyrics, Copyright, Publisher with multi-line notes),
+// continuation lines are indented to align under the start of the value.
+func printKeyValue(key, val string, maxW int) {
+	pad := maxW - runeLen(key)
+	if pad < 0 {
+		pad = 0
+	}
+	prefix := key + strings.Repeat(" ", pad) + ": "
+	if val == "" {
+		val = "(empty)"
+	}
+	// normalize the various line endings that appear in the synced info data
+	val = strings.ReplaceAll(val, "\r\n", "\n")
+	val = strings.ReplaceAll(val, "\r", "\n")
+	lines := strings.Split(val, "\n")
+	for i, line := range lines {
+		if i == 0 {
+			fmt.Println(prefix + line)
+		} else {
+			fmt.Println(strings.Repeat(" ", len(prefix)) + line)
+		}
+	}
+}
+
+// findScore resolves an idOrName (exact itemId or exact Work Title) to a single
+// score record. Mirrors the logic previously inline in download (now shared).
+// On name ambiguity it prints the candidates (with IDs) exactly like download did.
+func findScore(client *Client, idOrName string) (map[string]any, error) {
+	allItems, _, _, _, err := client.FetchCurrentState()
+	if err != nil {
+		return nil, err
+	}
+	var matches []map[string]any
+	// heuristic: looks like ID if contains '-' with left ~13 digits, right 16 alphanum
+	parts := strings.Split(idOrName, "-")
+	looksLikeID := len(parts) == 2 && len(parts[0]) >= 10 && len(parts[1]) == 16 && isHex(parts[1])
+	for _, itIface := range allItems {
+		it, ok := itIface.(map[string]any)
+		if !ok {
+			continue
+		}
+		if t, _ := it["type"].(float64); int(t) != 0 {
+			continue
+		}
+		sid := getString(it, "itemId")
+		if looksLikeID && sid == idOrName {
+			matches = append(matches, it)
+			break
+		}
+		if !looksLikeID {
+			data := getMap(it, "data")
+			title := ""
+			for _, infIface := range getAnySlice(data, "info") {
+				inf, ok := infIface.([]any)
+				if !ok || len(inf) < 2 {
+					continue
+				}
+				key := strings.ToLower(fmt.Sprintf("%v", inf[0]))
+				val := fmt.Sprintf("%v", inf[1])
+				if key == "work title" {
+					title = val
+				}
+			}
+			if title != "" && title == idOrName {
+				matches = append(matches, it)
+			}
+		}
+	}
+	if len(matches) == 0 {
+		return nil, fmt.Errorf("no score found for %q (use `scores search %q` to find IDs)", idOrName, idOrName)
+	}
+	if len(matches) > 1 {
+		fmt.Printf("Ambiguous name %q, multiple matches (use ID instead):\n", idOrName)
+		for _, m := range matches {
+			data := getMap(m, "data")
+			title := ""
+			for _, infIface := range getAnySlice(data, "info") {
+				inf, ok := infIface.([]any)
+				if !ok || len(inf) < 2 {
+					continue
+				}
+				key := strings.ToLower(fmt.Sprintf("%v", inf[0]))
+				val := fmt.Sprintf("%v", inf[1])
+				if key == "work title" {
+					title = val
+					break
+				}
+			}
+			id := getString(m, "itemId")
+			fmt.Printf("  %s  %s\n", id, title)
+		}
+		return nil, fmt.Errorf("ambiguous name")
+	}
+	return matches[0], nil
 }
 
 func findSetlist(client *Client, idOrName string) (map[string]any, error) {
@@ -742,6 +864,7 @@ func init() {
 	rootCmd.AddCommand(setlistCmd)
 
 	scoresCmd.AddCommand(scoresSearchCmd)
+	scoresCmd.AddCommand(scoresShowCmd)
 	scoresCmd.AddCommand(scoresDownloadCmd)
 	scoresDownloadCmd.Flags().StringP("directory", "d", "", "directory to drop the file (default: current directory)")
 	scoresDownloadCmd.Flags().StringP("output", "o", "", "exact output path (including filename, default: <song name>.pdf)")
