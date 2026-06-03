@@ -1,4 +1,4 @@
-module imslpcli
+module github.com/abourget/imslpcli
 
 go 1.25.0
 
